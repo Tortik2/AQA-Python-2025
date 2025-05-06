@@ -1,92 +1,86 @@
 import os
 from xml.etree import ElementTree as ET
 import json
-
-INPUT_FILE = "test_input.xml"
-OUTPUT_DIR = "out"
-CONFIG_XML = os.path.join(OUTPUT_DIR, "config.xml")
-META_JSON = os.path.join(OUTPUT_DIR, "meta.json")
-class UMLClass:
-    def __init__(self, name, is_root, documentation):
-        self.name = name
-        self.is_root = is_root
-        self.documentation = documentation
-        self.attributes = []  
-        self.children = []    
-
-    def to_config_xml(self): #Рекурсивно формируем XML-элемент
-        elem = ET.Element(self.name)
-        for attr in self.attributes:
-            child = ET.SubElement(elem, attr["name"])
-            child.text = attr["type"]
-        for child_class in self.children:
-            elem.append(child_class.to_config_xml())
+INPUT_XML = "test_input.xml"
+OUT_DIR = "out"
+CONFIG_FILE = os.path.join(OUT_DIR, "config.xml")
+META_FILE = os.path.join(OUT_DIR, "meta.json")
+class ModelUnit:
+    def __init__(self, tag, is_main, doc):
+        self.tag = tag  # имя класса
+        self.is_main = is_main  # корневой ли класс
+        self.doc = doc  # документация
+        self.fields = []  # список атрибутов
+        self.nested = []  # вложенные классы (по агрегации)
+    def make_config_xml(self):
+        # XML для config.xml
+        elem = ET.Element(self.tag)
+        for field in self.fields:
+            child_elem = ET.SubElement(elem, field["name"])
+            child_elem.text = field["type"]
+        for sub_model in self.nested:
+            elem.append(sub_model.make_config_xml())
         return elem
-    
-    def to_meta_json(self, class_relations): #Формируем словарь мета-информации
-        meta = {
-            "class": self.name,
-            "documentation": self.documentation,
-            "isRoot": self.is_root,
+    def make_meta_json(self, links):
+        # meta.json
+        block = {
+            "class": self.tag,
+            "documentation": self.doc,
+            "isMain": self.is_main,
             "parameters": [
-                {"name": attr["name"], "type": attr["type"]}
-                for attr in self.attributes
+                {"name": f["name"], "type": f["type"]}
+                for f in self.fields
             ]
         }
-        if self.name in class_relations:
-            meta["parameters"] += [
-                {"name": child.name, "type": "class"}
-                for child in self.children
+        if self.tag in links:
+            block["parameters"] += [
+                {"name": item.tag, "type": "class"}
+                for item in self.nested
             ]
-            meta["min"] = class_relations[self.name]["min"]
-            meta["max"] = class_relations[self.name]["max"]
-        return meta
-# Функция парсинга входного XML-файла
-def parse_input(filename):
-    tree = ET.parse(filename)
+            block["min"] = links[self.tag]["min"]
+            block["max"] = links[self.tag]["max"]
+        return block
+def parse_source(file_path):
+    tree = ET.parse(file_path)
     root = tree.getroot()
-    classes = {}
-    aggregations = []
-    # Извлекаем классы
-    for elem in root.findall("Class"):
-        name = elem.attrib["name"]
-        is_root = elem.attrib.get("isRoot", "false") == "true"
-        documentation = elem.attrib.get("documentation", "")
-        uml_class = UMLClass(name, is_root, documentation)
-        for attr in elem.findall("Attribute"):
-            uml_class.attributes.append({
+    units = {}
+    links = []
+    # Считываем классы
+    for node in root.findall("Class"):
+        tag = node.attrib["name"]
+        is_main = node.attrib.get("isRoot", "false") == "true"
+        doc = node.attrib.get("documentation", "")
+        model = ModelUnit(tag, is_main, doc)
+        for attr in node.findall("Attribute"):
+            model.fields.append({
                 "name": attr.attrib["name"],
                 "type": attr.attrib["type"]
             })
-        classes[name] = uml_class
-    # Извлекаем агрегации (связи между классами)
-    class_relations = {}
+        units[tag] = model
+    # связи между классами
+    relation_map = {}
     for agg in root.findall("Aggregation"):
-        source = agg.attrib["source"]
-        target = agg.attrib["target"]
-        src_mult = agg.attrib["sourceMultiplicity"]
-        min_val, max_val = (src_mult.split("..") + [src_mult])[:2] if ".." in src_mult else (src_mult, src_mult)
-
-        classes[target].children.append(classes[source])
-        if target not in class_relations:
-            class_relations[target] = {"min": "1", "max": "1"}
-        class_relations[source] = {"min": min_val, "max": max_val}
-    return classes, class_relations
-# Функция генерации выходных файлов
-def generate_output(classes, class_relations):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    #config.xml
-    for cls in classes.values():
-        if cls.is_root:
-            root_element = cls.to_config_xml()
-            tree = ET.ElementTree(root_element)
-            tree.write(CONFIG_XML, encoding="unicode")
+        who = agg.attrib["source"]
+        to = agg.attrib["target"]
+        how_many = agg.attrib["sourceMultiplicity"]
+        min_val, max_val = (how_many.split("..") + [how_many])[:2] if ".." in how_many else (how_many, how_many)
+        units[to].nested.append(units[who])
+        if to not in relation_map:
+            relation_map[to] = {"min": "1", "max": "1"}
+        relation_map[who] = {"min": min_val, "max": max_val}
+    return units, relation_map
+def save_files(models, relations):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    # config.xml
+    for m in models.values():
+        if m.is_main:
+            root_elem = m.make_config_xml()
+            ET.ElementTree(root_elem).write(CONFIG_FILE, encoding="unicode")
             break
-    #meta.json
-    meta = [cls.to_meta_json(class_relations) for cls in classes.values()]
-    with open(META_JSON, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=4)
-
+    # meta.json
+    meta_dump = [m.make_meta_json(relations) for m in models.values()]
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta_dump, f, indent=4)
 if __name__ == "__main__":
-    classes, class_relations = parse_input(INPUT_FILE)
-    generate_output(classes, class_relations)
+    all_units, rels = parse_source(INPUT_XML)
+    save_files(all_units, rels)
